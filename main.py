@@ -1,96 +1,112 @@
 from ib_insync import *
+from ib_insync.order import LimitOrder
 import datetime
+import pytz
 
-# Connect to IBKR
+tz = pytz.timezone('US/Eastern')
+now = datetime.datetime.now(tz)
+
 ib = IB()
-ib.connect('127.0.0.1', 4002, clientId=1)
+ib.connect('127.0.0.1', 7497, clientId=1)
 
-# Define the contract for the options
-contract = Option('SPX', '', '', 'SMART', right='P', exchange='SMART')
+contractDate = now.strftime('%Y%m%d')
 
-# Define the order parameters
-sell_order = Order(action='SELL', totalQuantity=1, orderType='MKT')
-buy_order = Order(action='BUY', totalQuantity=1, orderType='MKT')
+cds = ib.reqContractDetails(Option('SPX', contractDate, right="P", exchange='SMART'))
 
-# Define the target and stop loss percentages
-target_pct = 0.8
-stop_loss_pct = 0.2
+buyTicker = sellTicker = ib.reqMktData(cds[0].contract)
+buyContractDetail = sellContractDetail = None
+for idx in range(1, len(cds)):
+    ticker = ib.reqMktData(cds[idx].contract)
+    while ticker.modelGreeks is None or buyTicker.modelGreeks is None:
+        ib.sleep()
 
-# Define the allocation percentage
-allocation_pct = 0.1
+    if (buyTicker.modelGreeks.delta + 0.05) * (ticker.modelGreeks.delta + 0.05) < 0 and abs(buyTicker.modelGreeks.delta + 0.05) > abs(ticker.modelGreeks.delta + 0.05):
+        buyTicker = ticker
+        buyContractDetail = cds[idx]
 
-# Define the maximum number of positions and contracts
-max_positions = 1
-max_contracts = 1
+    if (sellTicker.modelGreeks.delta + 0.5) * (ticker.modelGreeks.delta + 0.5) < 0 and abs(sellTicker.modelGreeks.delta + 0.5) > abs(ticker.modelGreeks.delta + 0.5):
+        sellTicker = ticker
+        sellContractDetail = cds[idx]
 
-# Define the delta values for selecting the legs
-sell_delta = 0.5
-buy_delta = 0.05
+print("Buy: ", buyTicker, "\n")
+print("Details: ", buyContractDetail, "\n\n")
+print("Sell: ", sellTicker, "\n")
+print("Details: ", sellContractDetail, "\n\n")
 
-# Define the trailing stop loss amount
-trailing_stop_loss_pct = 0.2
+buyLeg = buyTicker.contract
+sellLeg = sellTicker.contract
 
-# Get the current time
-now = datetime.datetime.now()
+ib.qualifyContracts(buyLeg)
+ib.qualifyContracts(sellLeg)
 
-# Check if it is time to enter the market
-if now.hour == 15 and now.minute == 0:
-    # Check if there are already open positions
-    open_positions = ib.positions()
-    if len(open_positions) < max_positions:
-        # Check if there are already open contracts
-        open_contracts = ib.positions(contract)
-        if len(open_contracts) < max_contracts:
-            # Calculate the allocation amount based on available funds
-            account_summary = ib.accountSummary()
-            available_funds = float(next((item for item in account_summary if item.tag == 'AvailableFunds'), None).value)
-            allocation_amount = available_funds * allocation_pct
+contract = Option(symbol='SPX', lastTradeDateOrContractMonth=contractDate, right='P', exchange='SMART', multiplier=100, currency='USD')
+contract = Contract()
+contract.symbol = 'SPX'
+contract.secType = 'BAG'
+contract.lastTradeDateOrContractMonth = contractDate
+contract.right = 'P'
+contract.exchange = 'SMART'
+contract.currency = 'USD'
+contract.comboLegs = [
+    ComboLeg(conId=buyLeg.conId, ratio=1, action='BUY', exchange='SMART'),
+    ComboLeg(conId=sellLeg.conId, ratio=1, action='SELL', exchange='SMART')
+]
 
-            # Get the current option chain and select the legs by delta
-            option_chain = ib.reqSecDefOptParams(contract.symbol, '', contract.secType, contract.conId)
-            put_chain = [c for c in option_chain if c.right == 'P']
-            strikes = sorted(set(c.strike for c in put_chain))
-            atm_strike = strikes[len(strikes) // 2]
-            atm_options = [c for c in put_chain if c.strike == atm_strike]
-            sell_option = sorted(atm_options, key=lambda c: abs(c.delta - sell_delta))[0]
-            buy_option = sorted(atm_options, key=lambda c: abs(c.delta - buy_delta))[0]
+order = Order()
+order.action = 'BUY'
+order.orderType = 'LMT'
+order.totalQuantity = 1
+order.multiplier = 1
+minPriceIncrement = buyContractDetail.minTick
+minPrice = buyContractDetail.priceMagnifier * minPriceIncrement
+order.lmtPrice = round((buyTicker.bid + buyTicker.ask - sellTicker.bid - sellTicker.ask) / 2.0 / minPrice) * minPrice
+order.account = ib.managedAccounts()[0]
 
-            # Calculate the order prices based on the option prices and allocation amount
-            sell_price = sell_option.ask * sell_option.multiplier * sell_option.conId
-            buy_price = buy_option.bid * buy_option.multiplier * buy_option.conId
-            order_total = sell_price - buy_price
-            order_quantity = int(allocation_amount / order_total)
+trade = ib.placeOrder(contract, order)
+ib.sleep(5)
+print("Open: \n", trade, "\n\n")
 
-            # Place the order
-            sell_order.totalQuantity = order_quantity
-            buy_order.totalQuantity = order_quantity
-            sell_order.orderRef = 'Sell Put Spread'
-            buy_order.orderRef = 'Buy Put Spread'
-            trade = ib.placeOrder(contract, sell_order)
-            ib.placeOrder(contract, buy_order)
 
-            # Monitor the price of the spread each minute and use a trailing stop to exit
-            while True:
-                # Wait for a minute
-                ib.sleep(60)
+soldPrice = (sellTicker.bid + sellTicker.ask) / 2.0
+profitTarget = soldPrice * 0.2
+stopPrice = (soldPrice - (buyTicker.bid + buyTicker.ask) / 2.0) * 1.2
+flg = False
+while True:
+    spreadPrice = midPrice = (sellTicker.bid + sellTicker.ask - buyTicker.bid - buyTicker.ask) / 2.0
+    if spreadPrice * 1.2 < stopPrice:
+        print(f"Spread Price({spreadPrice}) * 1.2 < Stop Price({stopPrice})")
+        stopPrice = spreadPrice * 1.2
 
-                # Check if the trade is still open
-                if trade.orderStatus.status != 'Filled':
-                    break
+    print(f"Spread Price: {spreadPrice}, Stop Price: {stopPrice}, Profit Target: {profitTarget}")
+    # midPrice = (sellTicker.bid + sellTicker.ask - buyTicker.bid + buyTicker.ask) / 4.0
 
-                # Get the current price of the spread and calculate the trailing stop loss amount
-                sell_price = ib.reqMktData(sell_option.contract, '', False, False).marketPrice()
-                buy_price = ib.reqMktData(buy_option.contract, '', False, False).marketPrice()
-                current_price = sell_price - buy_price
-                stop_loss_amount = current_price * trailing_stop_loss_pct
+    if midPrice > stopPrice:
+        print(f"Mid Price({midPrice}) > Stop Price({stopPrice})")
+        if flg:
+            break
+        else:
+            flg = True
 
-                # Check if the current price has reached the profit target or trailing stop loss level
-                if current_price >= order_total * target_pct or current_price <= order_total - stop_loss_amount:
-                    # Place a market order to close the position and exit the loop
-                    close_order = Order(action='BUY', totalQuantity=order_quantity * 2, orderType='MKT')
-                    close_order.orderRef = 'Close Put Spread'
-                    ib.placeOrder(contract, close_order)
-                    break
+    if spreadPrice <= profitTarget:
+        print(f"Spread Price({spreadPrice}) is lower than Sold Price * 0.2({profitTarget})")
+        break
+    
+    print("\n")
+    
+    ib.sleep(60)
 
-    # Disconnect from IBKR after executing the strategy for the day
-    ib.disconnect()
+closingOrder = Order()
+closingOrder.action = 'SELL'
+closingOrder.orderType = 'LMT'
+closingOrder.totalQuantity = 1
+closingOrder.multiplier = 1
+minPriceIncrement = sellContractDetail.minTick
+minPrice = sellContractDetail.priceMagnifier * minPriceIncrement
+closingOrder.lmtPrice = round((buyTicker.bid + buyTicker.ask - sellTicker.bid - sellTicker.ask) / 2.0 / minPrice) * minPrice
+closingOrder.account = ib.managedAccounts()[0]
+
+trade = ib.placeOrder(contract, closingOrder)
+ib.sleep(5)
+print("Close: \n", trade, "\n\n")
+
+ib.disconnect()
