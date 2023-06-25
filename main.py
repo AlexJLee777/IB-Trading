@@ -39,7 +39,6 @@ sellLeg = sellTicker.contract
 ib.qualifyContracts(buyLeg)
 ib.qualifyContracts(sellLeg)
 
-contract = Option(symbol='SPX', lastTradeDateOrContractMonth=contractDate, right='P', exchange='SMART', multiplier=100, currency='USD')
 contract = Contract()
 contract.symbol = 'SPX'
 contract.secType = 'BAG'
