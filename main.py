@@ -3,7 +3,6 @@ from ib_insync.order import LimitOrder
 import datetime
 import time
 import pytz
-import schedule
 
 tz = pytz.timezone('US/Eastern')
 
